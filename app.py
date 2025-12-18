@@ -3,6 +3,8 @@ import pandas as pd
 from PIL import Image
 import database as db
 import numpy as np
+
+# pyzbarがない場合のエラー回避
 try:
     from pyzbar.pyzbar import decode
 except ImportError:
@@ -35,7 +37,7 @@ st.markdown("""
 
 st.title("🏥 オペ器械・インプラント在庫管理")
 
-# Session State for Scan Result
+# Session State
 if 'scanned_code' not in st.session_state:
     st.session_state.scanned_code = None
 if 'last_action' not in st.session_state:
@@ -49,19 +51,31 @@ with tab1:
     st.header("在庫一覧")
     df = db.get_inventory()
     
-    # Highlight low stock
+    # Highlight low stock function
     def highlight_low_stock(row):
-        if row['stock'] <= row['min_stock']:
+        # 在庫数(stock)が基準値(min_stock)以下の場合は赤くする
+        # データがない場合の安全策として .get を使用
+        current_stock = row.get('stock', 0)
+        min_limit = row.get('min_stock', 0)
+        
+        if current_stock <= min_limit:
             return ['background-color: #ffcccc'] * len(row)
         return [''] * len(row)
 
     if not df.empty:
-        # Display readable columns
-        display_df = df[['name', 'manufacturer', 'stock', 'expiry', 'barcode']].copy()
-        display_df.columns = ['商品名', 'メーカー', '在庫数', '期限', 'バーコード']
-        
+        # データフレームを表示（column_configで表示名だけ日本語に変える）
         st.dataframe(
-            display_df.style.apply(highlight_low_stock, axis=1),
+            df.style.apply(highlight_low_stock, axis=1),
+            column_config={
+                "name": "商品名",
+                "manufacturer": "メーカー",
+                "stock": "在庫数",
+                "expiry": "期限",
+                "barcode": "バーコード",
+                "min_stock": None, # 画面には表示しない
+                "id": None,        # 画面には表示しない
+                "image_path": None # 画面には表示しない
+            },
             use_container_width=True,
             height=500
         )
@@ -78,36 +92,44 @@ with tab2:
     # 1. Barcode Scanner
     st.subheader("📸 バーコードスキャン")
     if decode is None:
-        st.warning("⚠️ pyzbarがインストールされていません。バーコード機能は使用できません。")
+        st.warning("⚠️ サーバー環境にバーコード読取ライブラリがありません。手動検索を使用してください。")
+        # ヒント: packages.txt に libzbar0 が必要です
     else:
         img_file_buffer = st.camera_input("カメラでバーコードを読み取る")
         if img_file_buffer:
-            # Process image
-            image = Image.open(img_file_buffer)
-            decoded_objects = decode(image)
-            
-            if decoded_objects:
-                for obj in decoded_objects:
-                    code = obj.data.decode("utf-8")
-                    st.session_state.scanned_code = code
-                    st.success(f"読み取り成功: {code}")
-            else:
-                st.warning("バーコードを検出できませんでした。")
+            try:
+                image = Image.open(img_file_buffer)
+                decoded_objects = decode(image)
+                
+                if decoded_objects:
+                    for obj in decoded_objects:
+                        code = obj.data.decode("utf-8")
+                        st.session_state.scanned_code = code
+                        st.success(f"読み取り成功: {code}")
+                else:
+                    st.warning("バーコードを検出できませんでした。")
+            except Exception as e:
+                st.error(f"エラーが発生しました: {e}")
 
     # 2. Manual Search
     st.subheader("⌨️ 手動検索")
-    search_query = st.text_input("商品名またはバーコードを入力", value=st.session_state.scanned_code if st.session_state.scanned_code else "")
+    
+    # スキャン結果があればそれを初期値にする
+    default_val = st.session_state.scanned_code if st.session_state.scanned_code else ""
+    search_query = st.text_input("商品名またはバーコードを入力", value=default_val)
     
     target_product = None
     if search_query:
-        # Try finding by barcode first
+        # バーコードで検索
         target_product = db.get_product_by_barcode(search_query)
-        # If not found, naive search by name (for this demo, simple match)
+        
+        # 見つからなければ名前で部分一致検索
         if not target_product:
             all_products = db.get_inventory()
-            filtered = all_products[all_products['name'].str.contains(search_query, na=False)]
+            # 大文字小文字を区別せずに検索
+            filtered = all_products[all_products['name'].str.contains(search_query, case=False, na=False)]
             if not filtered.empty:
-                # Just pick the first one for simplicity in this mobile UI
+                # 検索候補が複数ある場合は簡易的に先頭を表示
                 target_product = filtered.iloc[0].to_dict()
     
     # 3. Action Area
@@ -129,7 +151,7 @@ with tab2:
                 
         with col2:
             st.error("発注 (リスト追加)")
-            order_qty = st.number_input("発注数", min_value=1, value=5, key="order_qty") # Default to reasonable order size
+            order_qty = st.number_input("発注数", min_value=1, value=5, key="order_qty") 
             if st.button("🛒 発注リストへ", use_container_width=True):
                 db.add_to_order_list(target_product['id'], order_qty)
                 st.session_state.last_action = f"{target_product['name']} を {order_qty} 個 発注リストに追加しました。"
@@ -144,7 +166,20 @@ with tab3:
     
     orders = db.get_orders()
     if not orders.empty:
-        st.dataframe(orders[['name', 'manufacturer', 'quantity', 'created_at']], use_container_width=True)
+        # 表示設定
+        st.dataframe(
+            orders,
+            column_config={
+                "name": "商品名",
+                "manufacturer": "メーカー",
+                "quantity": "発注数",
+                "created_at": "登録日時",
+                "id": None,
+                "product_id": None,
+                "status": None
+            },
+            use_container_width=True
+        )
         
         if st.button("✅ 発注完了とする (リストをクリア)", type="primary", use_container_width=True):
             db.clear_orders()
